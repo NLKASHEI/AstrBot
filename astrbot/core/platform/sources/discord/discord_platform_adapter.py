@@ -4,15 +4,15 @@ import re
 import sys
 import types
 import typing
-from typing import Any, cast
+from typing import Any
 
 import discord
 from discord.abc import GuildChannel, Messageable, PrivateChannel
-from discord.channel import DMChannel
+from discord.channel import DMChannel, GroupChannel
 
 from astrbot import logger
 from astrbot.api.event import MessageChain
-from astrbot.api.message_components import File, Image, Plain
+from astrbot.api.message_components import File, Image, Plain, Record
 from astrbot.api.platform import (
     AstrBotMessage,
     MessageMember,
@@ -26,7 +26,9 @@ from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.filter.command_group import CommandGroupFilter
 from astrbot.core.star.star import star_map
 from astrbot.core.star.star_handler import StarHandlerMetadata, star_handlers_registry
-from astrbot.core.utils.media_utils import MediaResolver  # noqa: F401  # 供外部 monkeypatch 使用
+from astrbot.core.utils.media_utils import (
+    MediaResolver,  # noqa: F401  # 供外部 monkeypatch 使用
+)
 
 from .client import DiscordBotClient
 from .discord_platform_event import DiscordPlatformEvent
@@ -49,7 +51,6 @@ class DiscordPlatformAdapter(Platform):
         event_queue: asyncio.Queue,
     ) -> None:
         super().__init__(platform_config, event_queue)
-        self.settings = platform_settings
         self.bot_self_id: str | None = None
         self.registered_handlers = []
         # 指令注册相关
@@ -58,6 +59,7 @@ class DiscordPlatformAdapter(Platform):
         self.activity_name = self.config.get("discord_activity_name", None)
         self.shutdown_event = asyncio.Event()
         self._polling_task = None
+        self.client = None
 
     @override
     async def send_by_session(
@@ -66,16 +68,17 @@ class DiscordPlatformAdapter(Platform):
         message_chain: MessageChain,
     ) -> None:
         """通过会话发送消息"""
-        if self.client.user is None:
+        if self.client is None or self.client.user is None:
             logger.error(
-                "[Discord] Client is not ready (self.client.user is None); message send skipped"
+                "[Discord] Client is not ready (client is None); message send skipped"
             )
             return
 
         # 创建一个 message_obj 以便在 event 中使用
         message_obj = AstrBotMessage()
+        # 剥离平台前缀 (如 "discord_123456" → "123456")
         if "_" in session.session_id:
-            session.session_id = session.session_id.split("_")[1]
+            session.session_id = session.session_id.split("_", 1)[1]
         channel_id_str = session.session_id
         channel = None
         try:
@@ -96,16 +99,20 @@ class DiscordPlatformAdapter(Platform):
 
         message_obj.message_str = message_chain.get_plain_text()
         message_obj.sender = MessageMember(
-            user_id=str(self.bot_self_id),
+            user_id=str(self.bot_self_id)
+            if self.bot_self_id is not None
+            else "unknown",
             nickname=self.client.user.display_name,
         )
-        message_obj.self_id = cast(str, self.bot_self_id)
+        message_obj.self_id = (
+            str(self.bot_self_id) if self.bot_self_id is not None else "unknown"
+        )
         message_obj.session_id = session.session_id
         message_obj.message = message_chain.chain
 
         # 创建临时事件对象来发送消息
         temp_event = DiscordPlatformEvent(
-            message_str=message_chain.get_plain_text(),
+            message_str=message_obj.message_str,
             message_obj=message_obj,
             platform_meta=self.meta(),
             session_id=session.session_id,
@@ -120,7 +127,7 @@ class DiscordPlatformAdapter(Platform):
         return PlatformMetadata(
             "discord",
             "Discord Adapter",
-            id=cast(str, self.config.get("id")),
+            id=str(self.config.get("id") or ""),
             default_config_tmpl=self.config,
             support_streaming_message=False,
         )
@@ -138,12 +145,13 @@ class DiscordPlatformAdapter(Platform):
             await self.handle_msg(abm)
 
         # 初始化 Discord 客户端
-        token = str(self.config.get("discord_token"))
-        if not token:
+        raw_token = self.config.get("discord_token")
+        if not raw_token:
             logger.error(
                 "[Discord] Bot token is not configured. Please set a valid token in the config file."
             )
             return
+        token = str(raw_token)
 
         proxy = self.config.get("discord_proxy") or None
         allow_bot_messages = bool(self.config.get("discord_allow_bot_messages"))
@@ -168,6 +176,7 @@ class DiscordPlatformAdapter(Platform):
 
         try:
             self._polling_task = asyncio.create_task(self.client.start_polling())
+            self._polling_task.add_done_callback(self._on_polling_task_done)
             await self.shutdown_event.wait()
         except discord.errors.LoginFailure:
             logger.error(
@@ -189,9 +198,13 @@ class DiscordPlatformAdapter(Platform):
         """根据 channel 对象和 guild_id 判断消息类型"""
         if guild_id is not None:
             return MessageType.GROUP_MESSAGE
-        if isinstance(channel, DMChannel) or getattr(channel, "guild", None) is None:
+        if isinstance(channel, DMChannel):
             return MessageType.FRIEND_MESSAGE
-        return MessageType.GROUP_MESSAGE
+        if isinstance(channel, GroupChannel):
+            return MessageType.GROUP_MESSAGE
+        if getattr(channel, "guild", None) is not None:
+            return MessageType.GROUP_MESSAGE
+        return MessageType.FRIEND_MESSAGE
 
     def _get_channel_id(
         self, channel: Messageable | GuildChannel | PrivateChannel
@@ -221,11 +234,9 @@ class DiscordPlatformAdapter(Platform):
             and hasattr(message, "guild")
             and message.guild
         ):
-            bot_member = (
-                message.guild.get_member(self.client.user.id)
-                if self.client and self.client.user
-                else None
-            )
+            bot_member = None
+            if self.client is not None and self.client.user is not None:
+                bot_member = message.guild.get_member(self.client.user.id)
             if bot_member and hasattr(bot_member, "roles"):
                 for role in bot_member.roles:
                     role_mention_str = f"<@&{role.id}>"
@@ -246,19 +257,22 @@ class DiscordPlatformAdapter(Platform):
             message_chain.append(Plain(text=abm.message_str))
         if message.attachments:
             for attachment in message.attachments:
-                if attachment.content_type and attachment.content_type.startswith(
-                    "image/",
-                ):
+                ct = attachment.content_type or ""
+                if ct.startswith("image/"):
                     message_chain.append(
                         Image(file=attachment.url, filename=attachment.filename),
                     )
+                elif ct.startswith("audio/"):
+                    message_chain.append(Record(file=attachment.url))
                 else:
                     message_chain.append(
                         File(name=attachment.filename, url=attachment.url),
                     )
         abm.message = message_chain
         abm.raw_message = message
-        abm.self_id = cast(str, self.bot_self_id)
+        abm.self_id = (
+            str(self.bot_self_id) if self.bot_self_id is not None else "unknown"
+        )
         abm.session_id = str(message.channel.id)
         abm.message_id = str(message.id)
         return abm
@@ -266,10 +280,29 @@ class DiscordPlatformAdapter(Platform):
     async def convert_message(self, data: dict) -> AstrBotMessage:
         """将平台消息转换成 AstrBotMessage"""
         # 由于 on_interaction 已被禁用，我们只处理普通消息
-        return self._convert_message_to_abm(data)
+        abm = self._convert_message_to_abm(data)
+        for component in abm.message:
+            if isinstance(component, Record):
+                audio_ref = component.file
+                if audio_ref:
+                    path_wav = await MediaResolver(
+                        audio_ref,
+                        media_type="audio",
+                        default_suffix=".wav",
+                    ).to_path(target_format="wav")
+                    component.file = path_wav
+                    component.url = path_wav
+                    component.path = path_wav
+        return abm
 
     async def handle_msg(self, message: AstrBotMessage, followup_webhook=None) -> None:
         """处理消息"""
+        if self.client is None or self.client.user is None:
+            logger.error(
+                "[Discord] Client is not ready (client is None or user is None); message handling skipped"
+            )
+            return
+
         message_event = DiscordPlatformEvent(
             message_str=message.message_str,
             message_obj=message,
@@ -278,12 +311,6 @@ class DiscordPlatformAdapter(Platform):
             client=self.client,
             interaction_followup_webhook=followup_webhook,
         )
-
-        if self.client.user is None:
-            logger.error(
-                "[Discord] Client is not ready (self.client.user is None); message handling skipped"
-            )
-            return
 
         # 检查是否为斜杠指令
         is_slash_command = message_event.interaction_followup_webhook is not None
@@ -320,7 +347,7 @@ class DiscordPlatformAdapter(Platform):
                     bot_member = raw_message.guild.get_member(
                         self.client.user.id,
                     )
-                except Exception:
+                except discord.DiscordException:
                     bot_member = None
             if bot_member and hasattr(bot_member, "roles"):
                 bot_roles = set(bot_member.roles)
@@ -343,6 +370,19 @@ class DiscordPlatformAdapter(Platform):
     async def terminate(self) -> None:
         logger.info("[Discord] Shutting down adapter...")
         self.shutdown_event.set()
+
+        # 先取消 polling，避免与命令清理竞争
+        if self._polling_task:
+            self._polling_task.cancel()
+            try:
+                await asyncio.wait_for(self._polling_task, timeout=10)
+            except asyncio.CancelledError:
+                logger.info("[Discord] Polling task cancelled successfully.")
+            except Exception as e:
+                logger.warning(
+                    f"[Discord] Error occurred while cancelling polling task: {e}"
+                )
+
         logger.info("[Discord] Cleaning up commands...")
         if self.enable_command_register and self.client:
             try:
@@ -359,16 +399,6 @@ class DiscordPlatformAdapter(Platform):
                     f"[Discord] Error occurred while cleaning up commands: {e}"
                 )
 
-        if self._polling_task:
-            self._polling_task.cancel()
-            try:
-                await asyncio.wait_for(self._polling_task, timeout=10)
-            except asyncio.CancelledError:
-                logger.info("[Discord] Polling task cancelled successfully.")
-            except Exception as e:
-                logger.warning(
-                    f"[Discord] Error occurred while cancelling polling task: {e}"
-                )
         logger.info("[Discord] Closing client connection...")
         if self.client and hasattr(self.client, "close"):
             try:
@@ -376,6 +406,17 @@ class DiscordPlatformAdapter(Platform):
             except Exception as e:
                 logger.warning(f"[Discord] Error occurred while closing client: {e}")
         logger.info("[Discord] Adapter shutdown complete.")
+
+    def _on_polling_task_done(self, task: asyncio.Task) -> None:
+        """polling task 完成回调，记录异常并唤醒 run() 避免僵尸状态"""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                f"[Discord] Polling task terminated with error: {exc}", exc_info=exc
+            )
+            self.shutdown_event.set()
 
     def register_handler(self, handler_info) -> None:
         """注册处理器信息"""
@@ -551,7 +592,9 @@ class DiscordPlatformAdapter(Platform):
             )
             abm.message = [Plain(text=message_str_for_filter)]
             abm.raw_message = ctx.interaction
-            abm.self_id = cast(str, self.bot_self_id)
+            abm.self_id = (
+                str(self.bot_self_id) if self.bot_self_id is not None else "unknown"
+            )
             abm.session_id = str(ctx.channel_id)
             abm.message_id = str(ctx.interaction.id)
 
