@@ -1,9 +1,6 @@
 import asyncio
-import inspect
 import re
 import sys
-import typing
-import types
 from typing import Any, cast
 
 import discord
@@ -26,7 +23,7 @@ from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.filter.command_group import CommandGroupFilter
 from astrbot.core.star.star import star_map
 from astrbot.core.star.star_handler import StarHandlerMetadata, star_handlers_registry
-from astrbot.core.utils.media_utils import MediaResolver  # noqa: F401  # 供外部 monkeypatch 使用
+from astrbot.core.utils.media_utils import MediaResolver
 
 from .client import DiscordBotClient
 from .discord_platform_event import DiscordPlatformEvent
@@ -103,14 +100,7 @@ class DiscordPlatformAdapter(Platform):
         message_obj.session_id = session.session_id
         message_obj.message = message_chain.chain
 
-        # 创建临时事件对象来发送消息
-        temp_event = DiscordPlatformEvent(
-            message_str=message_chain.get_plain_text(),
-            message_obj=message_obj,
-            platform_meta=self.meta(),
-            session_id=session.session_id,
-            client=self.client,
-        )
+        temp_event = self.create_event(message_obj)
         await temp_event.send(message_chain)
         await super().send_by_session(session, message_chain)
 
@@ -246,13 +236,18 @@ class DiscordPlatformAdapter(Platform):
             message_chain.append(Plain(text=abm.message_str))
         if message.attachments:
             for attachment in message.attachments:
-                ct = attachment.content_type or ""
-                if ct.startswith("image/"):
+                if attachment.content_type and attachment.content_type.startswith(
+                    "image/",
+                ):
                     message_chain.append(
                         Image(file=attachment.url, filename=attachment.filename),
                     )
-                elif ct.startswith("audio/"):
-                    message_chain.append(Record(file=attachment.url))
+                elif attachment.content_type and attachment.content_type.startswith(
+                    "audio/",
+                ):
+                    message_chain.append(
+                        Record(file=attachment.url, url=attachment.url),
+                    )
                 else:
                     message_chain.append(
                         File(name=attachment.filename, url=attachment.url),
@@ -267,11 +262,34 @@ class DiscordPlatformAdapter(Platform):
     async def convert_message(self, data: dict) -> AstrBotMessage:
         """将平台消息转换成 AstrBotMessage"""
         # 由于 on_interaction 已被禁用，我们只处理普通消息
-        return self._convert_message_to_abm(data)
+        abm = self._convert_message_to_abm(data)
+        for component in abm.message:
+            if isinstance(component, Record):
+                audio_ref = component.url or component.file
+                if audio_ref:
+                    path_wav = await MediaResolver(
+                        audio_ref,
+                        media_type="audio",
+                        default_suffix=".wav",
+                    ).to_path(target_format="wav")
+                    component.file = path_wav
+                    component.url = path_wav
+                    component.path = path_wav
+        return abm
 
-    async def handle_msg(self, message: AstrBotMessage, followup_webhook=None) -> None:
-        """处理消息"""
-        message_event = DiscordPlatformEvent(
+    def create_event(
+        self, message: AstrBotMessage, followup_webhook=None
+    ) -> DiscordPlatformEvent:
+        """Creates a Discord message event.
+
+        Args:
+            message: AstrBot message object to wrap.
+            followup_webhook: Optional slash-command follow-up webhook.
+
+        Returns:
+            Created Discord message event.
+        """
+        return DiscordPlatformEvent(
             message_str=message.message_str,
             message_obj=message,
             platform_meta=self.meta(),
@@ -279,6 +297,10 @@ class DiscordPlatformAdapter(Platform):
             client=self.client,
             interaction_followup_webhook=followup_webhook,
         )
+
+    async def handle_msg(self, message: AstrBotMessage, followup_webhook=None) -> None:
+        """处理消息"""
+        message_event = self.create_event(message, followup_webhook)
 
         if self.client.user is None:
             logger.error(
@@ -388,8 +410,7 @@ class DiscordPlatformAdapter(Platform):
         registered_commands = []
 
         for handler_md in star_handlers_registry:
-            plugin = star_map.get(handler_md.handler_module_path)
-            if not plugin or not plugin.activated:
+            if not star_map[handler_md.handler_module_path].activated:
                 continue
             if not handler_md.enabled:
                 continue
@@ -400,19 +421,25 @@ class DiscordPlatformAdapter(Platform):
 
                 cmd_name, description, cmd_filter_instance = cmd_info
 
-                # 从 handler 函数签名提取参数生成 Discord Option
-                options = self._build_slash_options(handler_md.handler)
-                param_names = [o.name for o in options]
-
                 # 创建动态回调
-                callback = self._create_dynamic_callback(cmd_name, param_names)
+                callback = self._create_dynamic_callback(cmd_name)
+
+                # 创建一个通用的参数选项来接收所有文本输入
+                options = [
+                    discord.Option(
+                        name="params",
+                        description="指令的所有参数",
+                        type=discord.SlashCommandOptionType.string,
+                        required=False,
+                    ),
+                ]
 
                 # 创建SlashCommand
                 slash_command = discord.SlashCommand(
                     name=cmd_name,
                     description=description,
                     func=callback,
-                    options=options if options else None,
+                    options=options,
                     guild_ids=[self.guild_id] if self.guild_id else None,
                 )
                 self.client.add_application_command(slash_command)
@@ -444,54 +471,12 @@ class DiscordPlatformAdapter(Platform):
     def _is_daily_command_quota_error(error: discord.HTTPException) -> bool:
         return getattr(error, "code", None) == 30034
 
-    @staticmethod
-    def _build_slash_options(handler) -> list:
-        """从 handler 函数签名提取参数，映射到 Discord SlashCommandOptionType"""
-        options = []
-        try:
-            sig = inspect.signature(handler)
-            for name, param in sig.parameters.items():
-                if name in ("self", "event"):
-                    continue
-                annotation = param.annotation
-                # 处理 Optional[T] 或 T | None
-                origin = typing.get_origin(annotation)
-                union_types = {typing.Union}
-                if hasattr(types, "UnionType"):
-                    union_types.add(types.UnionType)
-                if origin in union_types:
-                    args = typing.get_args(annotation)
-                    non_none = [a for a in args if a is not type(None)]
-                    if len(non_none) == 1:
-                        annotation = non_none[0]
-                # 类型映射
-                opt_type = discord.SlashCommandOptionType.string
-                if annotation is int:
-                    opt_type = discord.SlashCommandOptionType.integer
-                elif annotation is float:
-                    opt_type = discord.SlashCommandOptionType.number
-                elif annotation is bool:
-                    opt_type = discord.SlashCommandOptionType.boolean
-                required = param.default is inspect.Parameter.empty
-                options.append(
-                    discord.Option(
-                        name=name,
-                        description=f"请输入 {name}",
-                        type=opt_type,
-                        required=required,
-                    )
-                )
-        except Exception as e:
-            logger.warning(
-                f"Failed to build slash options for {handler!r}: {e}", exc_info=True
-            )
-        return options
-
-    def _create_dynamic_callback(self, cmd_name: str, param_names: list | None = None):
+    def _create_dynamic_callback(self, cmd_name: str):
         """为每个指令动态创建一个异步回调函数"""
-        param_names = param_names or []
 
-        async def dynamic_callback(ctx: discord.ApplicationContext, **kwargs) -> None:
+        async def dynamic_callback(
+            ctx: discord.ApplicationContext, params: str | None = None
+        ) -> None:
             # 1. 嘗試立即响应，防止超时 (移到最前面)
             followup_webhook = None
             try:
@@ -510,23 +495,14 @@ class DiscordPlatformAdapter(Platform):
             # 将平台特定的前缀'/'剥离，以适配通用的CommandFilter
             logger.debug(f"[Discord] Callback triggered: {cmd_name}")
             logger.debug(f"[Discord] Callback context: {ctx}")
-            # 按 param_names 顺序提取参数值，保证与函数签名一致
-            if param_names:
-                params_str = " ".join(
-                    str(kwargs[name])
-                    for name in param_names
-                    if kwargs.get(name) is not None
-                )
-            else:
-                params_str = " ".join(str(v) for v in kwargs.values() if v is not None)
-            logger.debug(f"[Discord] Callback params: {params_str}, kwargs: {kwargs}")
+            logger.debug(f"[Discord] Callback params: {params}")
             message_str_for_filter = cmd_name
-            if params_str:
-                message_str_for_filter += f" {params_str}"
+            if params:
+                message_str_for_filter += f" {params}"
 
             logger.debug(
                 f"[Discord] Slash command '{cmd_name}' triggered. "
-                f"Raw params: '{params_str}'. "
+                f"Raw params: '{params}'. "
                 f"Built command string: '{message_str_for_filter}'",
             )
 
@@ -589,22 +565,11 @@ class DiscordPlatformAdapter(Platform):
             return None
 
         # Discord 斜杠指令名称规范
-        # 注意：Discord API 端 \w 为 ASCII-only，中文命令名会被服务端拒绝
-        if cmd_name != cmd_name.lower() or not re.match(r"^[-_'\w]{1,32}$", cmd_name):
-            logger.warning(
-                f"[Discord] 跳过无法注册的斜杠命令名: '{cmd_name}'。Discord 不支持中文命令名，请改用英文名并通过 alias 保留中文触发。"
-            )
+        if cmd_name != cmd_name.lower() or not re.match(r"^[-_'\\w]{1,32}$", cmd_name):
+            logger.debug(f"[Discord] Skipping invalid slash command format: {cmd_name}")
             return None
 
-        # 优先用 handler 的 docstring 作为命令描述
-        handler = handler_metadata.handler
-        description = (
-            (handler.__doc__ or "").strip().split("\n")[0]
-            if hasattr(handler, "__doc__") and handler.__doc__
-            else ""
-        )
-        if not description:
-            description = handler_metadata.desc or f"Command: {cmd_name}"
+        description = handler_metadata.desc or f"Command: {cmd_name}"
         if len(description) > 100:
             description = f"{description[:97]}..."
 
