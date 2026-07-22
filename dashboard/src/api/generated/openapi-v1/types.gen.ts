@@ -67,6 +67,24 @@ export type BotRegistrationRequest = {
 
 export type action = 'start' | 'poll';
 
+/**
+ * Per-request ChatUI feature flags. A value here takes priority over its legacy top-level field, followed by the documented default.
+ */
+export type ChatFlags = {
+    /**
+     * Inject the inline HTML GenUI system prompt for this request.
+     */
+    enable_inline_genui?: boolean;
+    /**
+     * Allow the ChatUI default system prompt when no persona overrides it.
+     */
+    enable_default_system_prompt?: boolean;
+    /**
+     * Enable streaming model output for this request. This value takes priority over the legacy top-level enable_streaming field.
+     */
+    enable_streaming?: boolean;
+};
+
 export type ChatMessagePatchRequest = {
     content: {
         [key: string]: unknown;
@@ -76,14 +94,23 @@ export type ChatMessagePatchRequest = {
 export type ChatMessageRegenerateRequest = {
     selected_provider?: string;
     selected_model?: string;
+    /**
+     * Deprecated compatibility field. It is used only when flags.enable_streaming is absent; otherwise flags.enable_streaming takes priority.
+     * @deprecated
+     */
     enable_streaming?: boolean;
+    flags?: ChatFlags;
 };
 
 export type ChatProjectRequest = {
     title?: string;
     emoji?: string;
     description?: string;
+    workspace_type?: 'session' | 'project' | 'custom';
+    workspace_path?: string;
 };
+
+export type workspace_type = 'session' | 'project' | 'custom';
 
 export type ChatRequest = {
     /**
@@ -100,7 +127,12 @@ export type ChatRequest = {
     config_name?: string;
     selected_provider?: string;
     selected_model?: string;
+    /**
+     * Deprecated compatibility field. It is used only when flags.enable_streaming is absent; otherwise flags.enable_streaming takes priority.
+     * @deprecated
+     */
     enable_streaming?: boolean;
+    flags?: ChatFlags;
     /**
      * Internal WebUI flag for edit/regenerate flows.
      */
@@ -137,7 +169,12 @@ export type ChatThreadMessageRequest = {
     message: (string | Array<MessagePart>);
     selected_provider?: string;
     selected_model?: string;
+    /**
+     * Deprecated compatibility field. It is used only when flags.enable_streaming is absent; otherwise flags.enable_streaming takes priority.
+     * @deprecated
+     */
     enable_streaming?: boolean;
+    flags?: ChatFlags;
 };
 
 export type CommandPatchRequest = {
@@ -255,13 +292,22 @@ export type JsonSchema = {
     [key: string]: unknown;
 };
 
+export type KnowledgeBaseCreateRequest = KnowledgeBaseRequest & {
+    kb_name: string;
+    embedding_provider_id: string;
+};
+
 export type KnowledgeBaseRequest = {
-    name: string;
+    kb_name?: string;
     description?: string;
-    embedding_provider_id?: string;
-    rerank_provider_id?: string;
-    chunking?: DynamicConfig;
-    metadata?: DynamicConfig;
+    emoji?: string;
+    embedding_provider_id?: (string) | null;
+    rerank_provider_id?: (string) | null;
+    chunk_size?: number;
+    chunk_overlap?: number;
+    top_k_dense?: number;
+    top_k_sparse?: number;
+    top_m_final?: number;
 };
 
 export type KnowledgeDocumentImportRequest = {
@@ -271,7 +317,6 @@ export type KnowledgeDocumentImportRequest = {
 
 export type KnowledgeDocumentUploadRequest = {
     file: (Blob | File);
-    parser?: string;
 };
 
 export type KnowledgeDocumentUrlImportRequest = {
@@ -317,6 +362,7 @@ export type MessagePart = {
     attachment_id?: string;
     url?: string;
     filename?: string;
+    stored_filename?: string;
     mime_type?: string;
     [key: string]: unknown | string;
 };
@@ -1357,6 +1403,16 @@ export type StopChatSessionData = {
 export type StopChatSessionResponse = (SuccessEnvelope);
 
 export type StopChatSessionError = unknown;
+
+export type ResumeChatRunData = {
+    path: {
+        run_id: string;
+    };
+};
+
+export type ResumeChatRunResponse = (unknown);
+
+export type ResumeChatRunError = unknown;
 
 export type UpdateChatMessageData = {
     body: ChatMessagePatchRequest;
@@ -2606,7 +2662,7 @@ export type ListKnowledgeBasesResponse = (SuccessEnvelope);
 export type ListKnowledgeBasesError = unknown;
 
 export type CreateKnowledgeBaseData = {
-    body: KnowledgeBaseRequest;
+    body: KnowledgeBaseCreateRequest;
 };
 
 export type CreateKnowledgeBaseResponse = (SuccessEnvelope);
