@@ -1,6 +1,5 @@
 import asyncio
 import inspect
-import logging
 import re
 import sys
 import typing
@@ -13,7 +12,7 @@ from discord.channel import DMChannel
 
 from astrbot import logger
 from astrbot.api.event import MessageChain
-from astrbot.api.message_components import File, Image, Plain
+from astrbot.api.message_components import File, Image, Plain, Record
 from astrbot.api.platform import (
     AstrBotMessage,
     MessageMember,
@@ -27,6 +26,7 @@ from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.filter.command_group import CommandGroupFilter
 from astrbot.core.star.star import star_map
 from astrbot.core.star.star_handler import StarHandlerMetadata, star_handlers_registry
+from astrbot.core.utils.media_utils import MediaResolver  # noqa: F401  # 供外部 monkeypatch 使用
 
 from .client import DiscordBotClient
 from .discord_platform_event import DiscordPlatformEvent
@@ -246,12 +246,13 @@ class DiscordPlatformAdapter(Platform):
             message_chain.append(Plain(text=abm.message_str))
         if message.attachments:
             for attachment in message.attachments:
-                if attachment.content_type and attachment.content_type.startswith(
-                    "image/",
-                ):
+                ct = attachment.content_type or ""
+                if ct.startswith("image/"):
                     message_chain.append(
                         Image(file=attachment.url, filename=attachment.filename),
                     )
+                elif ct.startswith("audio/"):
+                    message_chain.append(Record(file=attachment.url))
                 else:
                     message_chain.append(
                         File(name=attachment.filename, url=attachment.url),
@@ -481,7 +482,7 @@ class DiscordPlatformAdapter(Platform):
                     )
                 )
         except Exception as e:
-            logger.debug(f"Failed to build slash options for {handler!r}: {e}", exc_info=True)
+            logger.warning(f"Failed to build slash options for {handler!r}: {e}", exc_info=True)
         return options
 
     def _create_dynamic_callback(self, cmd_name: str, param_names: list | None = None):
@@ -584,9 +585,9 @@ class DiscordPlatformAdapter(Platform):
             return None
 
         # Discord 斜杠指令名称规范
-        # Discord 支持 Unicode 命令名（如中文），放宽匹配并确保全小写
+        # 注意：Discord API 端 \w 为 ASCII-only，中文命令名会被服务端拒绝
         if cmd_name != cmd_name.lower() or not re.match(r"^[-_'\w]{1,32}$", cmd_name):
-            logger.debug(f"[Discord] Skipping invalid slash command format: {cmd_name}")
+            logger.warning(f"[Discord] 跳过无法注册的斜杠命令名: '{cmd_name}'。Discord 不支持中文命令名，请改用英文名并通过 alias 保留中文触发。")
             return None
 
         # 优先用 handler 的 docstring 作为命令描述
